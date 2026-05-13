@@ -879,7 +879,7 @@ def main():
 
     # Usage 采集：优先用 UsageTracker（monkey-patch OpenAI/Anthropic SDK），
     # 非 Claude 模型走 ChatOpenAI SDK，install_openai_hooks 可拦截
-    usage = _tracker.get_usage()
+    usage = (_tracker.get_usage() if _tracker else {})
 
     result = {"output": output, "trajectory": trajectory, "usage": usage}
     # 单行输出，runner._parse_last_json 从末行解析
