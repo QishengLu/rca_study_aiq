@@ -1,0 +1,19 @@
+name: SonarQube Analysis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  sonarqube:
+    uses: NVIDIA_AI_Blueprints/sonarqube-workflows/.github/workflows/sonarqube-reusable-template.yml@main
+    with:
+      language: python
+      organization: TEGRASW
+      team: Blueprints-SRE
+      product: aiq
+      scmRepoName: aiq
+      nspectId: NSPECT-O9LK-HNL3
+    secrets: inherit

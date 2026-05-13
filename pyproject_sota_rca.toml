@@ -1,0 +1,16 @@
+# Minimal pyproject snippet for sota-rca-study entry-point registration.
+# Merge this into the framework's existing pyproject.toml after forking.
+#
+# To merge:
+#   1. Add this entry-points block to the framework's pyproject.toml
+#   2. Run: uv pip install -e .
+#   3. Verify: uv run rca llm-eval show-agents | grep aiq
+
+[project.entry-points."llm_eval.agents"]
+aiq = "aiq_rca.agents.eval_agent:AIQEvalAgent"
+
+# Also ensure these deps are present in the framework's [project]:
+# dependencies = [
+#     ...
+#     "sota-rca-study @ file://${PROJECT_ROOT}/../..",
+# ]
