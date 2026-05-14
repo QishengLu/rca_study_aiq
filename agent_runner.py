@@ -344,13 +344,18 @@ def compress_to_graph(
     compress_sp: str,
     compress_up: str,
     raw_recent_messages: list | None = None,
-    previous_graph: dict | None = None,
     max_retries: int = 3,
 ) -> dict:
     """
-    用 stdin 传入的 compress_system_prompt + compress_user_prompt 把累积 findings
-    压成 v2 CausalGraph dict。每次都从全部 findings 重新生成（让新证据自然修正旧
-    结论），不增量更新 graph。
+    用 stdin 传入的 compress_system_prompt + compress_user_prompt 把累积的轨迹
+    压成 v2 CausalGraph dict。每次都从全部 findings + 全部 raw messages 独立
+    重新生成 v2 envelope —— 不接收"上一轮 graph"作 baseline，避免污染本轮判断。
+
+    aiq AIRA 5-stage 的"中间 graph 演化"语义体现在：
+      - 每个 stage (data_research / 每一轮 refine) 跑完后调一次 compress → v_n graph
+      - v_n graph 作为 *下一个 stage 的 sub-loop* 的输入（让 sub-loop LLM 看到
+        当前结论决定 strengthen 哪里）—— 不是作为下一次 compress 的 baseline
+      - 最后一个 stage 的 compress 输出 = 最终评估结果
 
     Args:
         accumulated_findings: data_research / refine sub-loops 输出的 findings 文字
@@ -362,13 +367,8 @@ def compress_to_graph(
             原始 LangChain BaseMessage（含 AIMessage tool_calls + ToolMessage
             原始 SQL/result）。传入后 compress 同时看到 raw 证据 + 高层 findings，
             匹配 ThinkDepthAI 上游"compress 看完整 raw trajectory"的设计意图。
-            注意：传入"全部累积"而非"最近若干条"，避免丢失早期证据。
-        previous_graph: 可选 — 上一轮 build_graph / reflect_on_graph 产生的 v2
-            CausalGraph。传入后 compress 看到 baseline + 新证据，能在上一轮结论
-            基础上做增量修订（而不是每次从零重建），尊重 aiq AIRA 5-stage 反思
-            机制的"中间 graph 单调演化"语义。
 
-    失败兜底：3 次重试解析失败 → 返回空 graph，不崩溃。
+    失败兜底：3 次重试解析失败 → 返回空 v2 envelope，不崩溃。
     """
     from langchain_core.messages import AIMessage, ToolMessage as LCToolMessage
 
@@ -400,26 +400,12 @@ def compress_to_graph(
                 + "\n\n---\n\n"
             )
 
-    # Previous-round v2 graph as baseline for incremental refinement.
-    prev_graph_text = ""
-    if previous_graph and (previous_graph.get("root_causes") or previous_graph.get("propagation")):
-        prev_graph_text = (
-            "## Previous-round RCA output (v2 schema baseline)\n\n"
-            "The compress step has run before. This is the v2 envelope produced last\n"
-            "time. Treat it as your **starting point**: keep what's still supported by\n"
-            "the new evidence below, REMOVE claims that the new evidence contradicts,\n"
-            "ADD root_causes / propagation edges that new evidence reveals.\n\n"
-            f"```json\n{json.dumps(previous_graph, ensure_ascii=False, indent=2)}\n```\n\n"
-            "---\n\n"
-        )
-
     last_err: str | None = None
     for attempt in range(max_retries):
         messages = [
             SystemMessage(content=compress_sp),
             HumanMessage(
                 content=(
-                    f"{prev_graph_text}"
                     f"{raw_text}"
                     f"## High-level investigation findings\n\n"
                     f"{findings_text}\n\n"
@@ -687,7 +673,6 @@ def build_graph(state: RCAState, config: RunnableConfig) -> dict:
     graph = compress_to_graph(
         accumulated, compress_sp, compress_up,
         raw_recent_messages=raw_all,
-        previous_graph=None,  # build_graph is the first compress call
     )
     # v2 schema: root_causes + propagation. Logger keeps both names for debug.
     logger.info(
@@ -757,15 +742,17 @@ def reflect_on_graph(state: RCAState, config: RunnableConfig) -> dict:
         accumulated.append(findings)
 
         # Compress sees: accumulated findings + ALL raw messages (main-loop +
-        # every refine round so far) + previous v2 graph as baseline.
-        # This matches both:
-        #   - ThinkDepthAI upstream "compress on full raw trajectory" design
-        #   - aiq AIRA 5-stage "monotonically-evolving intermediate graph" design
+        # every refine round so far). Each compress is INDEPENDENT: it doesn't
+        # take the previous v_n graph as baseline — instead the v_n graph was
+        # already injected into THIS refine sub-loop's HumanMessage (via
+        # `current_graph=graph` in run_refine_exploration), so the sub-loop's
+        # LLM already saw it and let that shape its investigation. The new
+        # accumulated trajectory thus encodes "v_n graph + delta evidence",
+        # and compress builds v_{n+1} from that combined evidence.
         raw_for_compress = list(state.get("all_tool_messages") or []) + list(all_msgs)
         new_graph = compress_to_graph(
             accumulated, compress_sp, compress_up,
             raw_recent_messages=raw_for_compress,
-            previous_graph=graph,  # ← let LLM see the v_n graph as baseline
         )
         # 防御：如果 compress 失败返回了空 graph，保留上一版本不退化
         if new_graph.get("root_causes") or new_graph.get("nodes"):
