@@ -110,26 +110,31 @@ RCA_TOOLS_BY_NAME = {t.name: t for t in RCA_TOOLS}
 
 class RCAState(TypedDict):
     """
-    对应 AIRA 的 AIRAState，适配 RCA 场景。中间状态用 causal_graph (JSON, 与最终
-    输出 schema 一致) 替代了原 AIRA 的 running_summary (text)。
+    对应 AIRA 的 AIRAState，适配 RCA 场景。
 
-    字段映射 / 新增：
-      queries               → 调查查询列表（来自 generate_queries）
-      data_research_results → 主 data_research 的 findings 文本（list[str]）
-      schema_messages       → main loop 抽出的 schema 发现消息对（list_tables +
-                               get_schema 的 AIMessage + ToolMessage 配对），供 refine
-                               sub-loop 复用，避免冷启动重新发现
-      causal_graph          → 当前的 CausalGraph (dict)，每次 reflect 后更新
-      accumulated_findings  → main loop + 各轮 reflect sub-loop 的全部 findings 文本，
-                               compress 时累积传给 LLM
-      final_report          → 最终输出（causal_graph 序列化后的 JSON 字符串）
-      all_tool_messages     → 完整工具调用轨迹（用于 stdout trajectory）
+    设计原则（"graph 就是 findings"）：
+      - 不维护自然语言 findings list；每个 stage 跑完后用 compress 把累积 raw
+        messages 直接结构化成 v2 CausalGraph（root_causes + propagation）。
+      - v2 graph 就是这个 stage 的 "finding"。
+      - v2 graph 注入到下一个 stage 的 sub-loop HumanMessage（让 sub-loop LLM
+        看到当前结论决定下一步 strengthen 哪里）。
+      - compress 每次独立从 raw messages 生成 v2 graph（不接收上一版 graph 当
+        baseline），匹配 ThinkDepthAI 上游设计。
+
+    字段：
+      queries           → 调查查询列表（来自 generate_queries）
+      schema_messages   → main loop 抽出的 schema 发现消息对（list_tables +
+                           get_schema 的 AIMessage + ToolMessage 配对），供 refine
+                           sub-loop 复用，避免冷启动重新发现
+      causal_graph      → 当前的 v2 CausalGraph (dict)，每次 stage 结束后 compress
+                           生成；它就是 findings 的结构化形态
+      final_report      → 最终输出（causal_graph 序列化后的 JSON 字符串）
+      all_tool_messages → 跨节点累积的完整 raw messages（AIMessage + ToolMessage）
+                           —— compress 唯一的"证据源"
     """
     queries: list[dict]
-    data_research_results: list[str]
     schema_messages: list
     causal_graph: dict
-    accumulated_findings: list[str]
     final_report: str
     all_tool_messages: Annotated[list, operator.add]  # 跨节点累积
 
@@ -340,65 +345,59 @@ def extract_schema_messages(all_msgs: list) -> list:
 # ── Helper: compress findings → CausalGraph (复用 stdin compress_*)────────
 
 def compress_to_graph(
-    accumulated_findings: list[str],
+    raw_messages: list,
     compress_sp: str,
     compress_up: str,
-    raw_recent_messages: list | None = None,
     max_retries: int = 3,
 ) -> dict:
     """
-    用 stdin 传入的 compress_system_prompt + compress_user_prompt 把累积的轨迹
-    压成 v2 CausalGraph dict。每次都从全部 findings + 全部 raw messages 独立
-    重新生成 v2 envelope —— 不接收"上一轮 graph"作 baseline，避免污染本轮判断。
+    用 stdin 传入的 compress_system_prompt + compress_user_prompt 把累积的 raw
+    trajectory 压成 v2 CausalGraph dict。每次都从全部 raw messages 独立重新生成
+    v2 envelope —— 不接收"上一轮 graph"作 baseline，避免污染本轮判断。
 
-    aiq AIRA 5-stage 的"中间 graph 演化"语义体现在：
-      - 每个 stage (data_research / 每一轮 refine) 跑完后调一次 compress → v_n graph
-      - v_n graph 作为 *下一个 stage 的 sub-loop* 的输入（让 sub-loop LLM 看到
-        当前结论决定 strengthen 哪里）—— 不是作为下一次 compress 的 baseline
+    设计原则（"graph 就是 findings"）：
+      - 不维护自然语言 findings list；compress 直接从 raw messages 生成结构化 v2
+        graph（root_causes + propagation 含 SQL evidence）。v2 graph 就是 findings 的
+        最终形态，比自然语言精确、可验证、可比较。
+      - aiq 5-stage 的"中间 graph 演化"通过 sub-loop 的 HumanMessage 注入实现：
+          stage_n 跑完 → compress(累积 raw) → v_n graph
+          → graph_v_n 作为 stage_{n+1} sub-loop 的 HumanMessage 输入（让 LLM 看到
+            当前结论决定 strengthen 哪里）
+          → stage_{n+1} 产生新 raw messages，累积到 state.all_tool_messages
+          → compress 从全部 raw 独立生成 v_{n+1}（不参考 v_n 作 baseline）
       - 最后一个 stage 的 compress 输出 = 最终评估结果
 
     Args:
-        accumulated_findings: data_research / refine sub-loops 输出的 findings 文字
-            (list[str])，每条是 LLM 已经总结过的高层叙述。
-        compress_sp: stdin 传入的 v3 COMPRESS_FINDINGS_SP (含 v3 agent_contract
-            schema)。
+        raw_messages: 跨 stage 累积的完整 raw LangChain BaseMessage 列表（含
+            AIMessage tool_calls + ToolMessage 原始 SQL/result）。这是 compress
+            唯一的证据源。
+        compress_sp: stdin 传入的 v3 COMPRESS_FINDINGS_SP (含 v3 agent_contract schema)。
         compress_up: stdin 传入的 v3 COMPRESS_FINDINGS_UP。
-        raw_recent_messages: 可选 — 主 ReAct loop / refine sub-loop 的全部累积
-            原始 LangChain BaseMessage（含 AIMessage tool_calls + ToolMessage
-            原始 SQL/result）。传入后 compress 同时看到 raw 证据 + 高层 findings，
-            匹配 ThinkDepthAI 上游"compress 看完整 raw trajectory"的设计意图。
 
     失败兜底：3 次重试解析失败 → 返回空 v2 envelope，不崩溃。
     """
     from langchain_core.messages import AIMessage, ToolMessage as LCToolMessage
 
-    findings_text = "\n\n---\n\n".join(accumulated_findings)
     llm = _make_model(max_tokens=32000)
 
-    # If raw messages provided, materialize them into the prompt text alongside findings.
-    raw_text = ""
-    if raw_recent_messages:
-        raw_blocks = []
-        for m in raw_recent_messages:
-            if isinstance(m, AIMessage):
-                content = m.content if isinstance(m.content, str) else str(m.content)
-                tool_calls_str = ""
-                if getattr(m, "tool_calls", None):
-                    tool_calls_str = "\n  tool_calls: " + json.dumps(
-                        [{"name": tc.get("name", ""), "args": tc.get("args", {})}
-                         for tc in m.tool_calls],
-                        ensure_ascii=False,
-                    )
-                raw_blocks.append(f"[Assistant] {content}{tool_calls_str}")
-            elif isinstance(m, LCToolMessage):
-                content = m.content if isinstance(m.content, str) else str(m.content)
-                raw_blocks.append(f"[Tool Result] {content}")
-        if raw_blocks:
-            raw_text = (
-                "## Raw investigation evidence (assistant tool_calls + tool results)\n\n"
-                + "\n\n".join(raw_blocks)
-                + "\n\n---\n\n"
-            )
+    # Materialize raw messages into prompt text. compress sees full raw
+    # trajectory (matching ThinkDepthAI upstream design).
+    raw_blocks = []
+    for m in raw_messages or []:
+        if isinstance(m, AIMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            tool_calls_str = ""
+            if getattr(m, "tool_calls", None):
+                tool_calls_str = "\n  tool_calls: " + json.dumps(
+                    [{"name": tc.get("name", ""), "args": tc.get("args", {})}
+                     for tc in m.tool_calls],
+                    ensure_ascii=False,
+                )
+            raw_blocks.append(f"[Assistant] {content}{tool_calls_str}")
+        elif isinstance(m, LCToolMessage):
+            content = m.content if isinstance(m.content, str) else str(m.content)
+            raw_blocks.append(f"[Tool Result] {content}")
+    raw_text = "\n\n".join(raw_blocks) if raw_blocks else "(no raw messages provided)"
 
     last_err: str | None = None
     for attempt in range(max_retries):
@@ -406,9 +405,8 @@ def compress_to_graph(
             SystemMessage(content=compress_sp),
             HumanMessage(
                 content=(
-                    f"{raw_text}"
-                    f"## High-level investigation findings\n\n"
-                    f"{findings_text}\n\n"
+                    f"## Raw investigation trajectory (assistant tool_calls + tool results)\n\n"
+                    f"{raw_text}\n\n"
                     f"---\n\n"
                     f"{compress_up}"
                 )
@@ -441,26 +439,42 @@ def run_refine_exploration(
     system_prompt: str,
     current_graph: dict,
     schema_msgs: list,
+    prior_messages: list | None = None,
     max_rounds: int = 15,
 ) -> tuple[str, list]:
     """
-    refine 阶段的 sub-loop。除了"前期探索的 SQL/结果文字"之外，全部复用 main loop
-    的上下文：
-      - SystemMessage (stdin 的 system_prompt)
-      - HumanMessage (与 main loop 一致的 investigation query 模板)
-      - main loop 真实的 schema 发现 AIMessage + ToolMessage 配对
-      - bind_tools 的工具列表
-      - 当前 CausalGraph (要锦上添花的对象)
-      - "STRENGTHEN not overturn" 的 refine 指令
+    refine 阶段的 sub-loop。完整复用之前所有阶段的上下文，让 refine LLM 真正
+    看到调查全貌而非只看高层摘要。
 
-    LLM 看到这套上下文后会自然产生"我已经查过 schema → 我之前的结论是这个 graph
-    → 现在该补哪个弱点 → 跑几条 SQL → 返回发现"的连贯推理。
+    messages list 构造顺序：
+      ① SystemMessage (stdin system_prompt — RCA_ANALYSIS_SP)
+      ② HumanMessage (investigation query + data location，保持跟 main loop 一致)
+      ③ schema_msgs — main loop 抽出的 schema 发现消息对（list_tables/get_schema
+         的 AIMessage + ToolMessage 配对，让 refine LLM 知道已经查过 schema）
+      ④ prior_messages — main loop + 之前所有 refine 轮的完整 raw messages
+         （AIMessage tool_calls + ToolMessage）。让 refine LLM 看到所有累积证据，
+         避免重复跑工具，且能在新证据上 strengthen。
+      ⑤ HumanMessage — 当前 v_n CausalGraph + v2 schema reminder + refine 指令
 
+    LLM 看到这套上下文：知道角色（SP）、知道任务（query）、知道 schema、看到
+    全部已有证据（prior_messages）、知道当前结论（current_graph）、知道下一步
+    要 STRENGTHEN 哪个 v2 字段。
+
+    Args:
+        prior_messages: main loop + 之前 refine 轮累积的完整 raw messages 列表。
+            如果首次 refine（reflect round 1），就是 main loop 的全部
+            all_tool_messages。后续轮次还包含之前 refine 的 raw。
     Returns:
-        (findings_text, tool_messages_list)
+        (findings_text, tool_messages_list) — findings_text 保留向后兼容，
+        实际下游 compress 用 graph 取代 findings。
     """
     model = _make_model()
     model_with_tools = model.bind_tools(RCA_TOOLS)
+
+    # ④ De-duplicate: schema_msgs 已经包含 list_tables/get_schema 配对，
+    # 如果 prior_messages 里又有相同的就跳过避免冗余。
+    schema_msg_ids = set(id(m) for m in (schema_msgs or []))
+    prior_filtered = [m for m in (prior_messages or []) if id(m) not in schema_msg_ids]
 
     messages: list = [
         # ① 复用 main loop 的 SystemMessage
@@ -472,9 +486,11 @@ def run_refine_exploration(
             f"Start by calling `list_tables_in_directory(directory=\"{data_dir}\")` "
             f"to discover available parquet files."
         )),
-        # ③ 直接塞入 main loop 的真实 schema 发现消息对（AIMessage + ToolMessage）
+        # ③ main loop 真实的 schema 发现消息对（AIMessage + ToolMessage）
         *schema_msgs,
-        # ④ 追加 refine 指令 + 当前 RCA output (v2 schema) + schema reminder
+        # ④ main loop + 之前 refine 轮累积的所有 raw messages
+        *prior_filtered,
+        # ⑤ 追加 refine 指令 + 当前 RCA output (v2 schema) + schema reminder
         # Important: explicitly tell the LLM the output schema (v2 from
         # rcabench-platform agent_contract) so it understands which fields
         # to strengthen. The current_graph passed in is already in v2 format
@@ -619,37 +635,38 @@ def generate_queries(state: RCAState, config: RunnableConfig) -> dict:
 def data_research(state: RCAState, config: RunnableConfig) -> dict:
     """
     主数据探索节点。对每个查询跑一次 run_data_exploration sub-loop（max=60）。
-    findings 累积到 accumulated_findings，schema 发现消息抽出存到 schema_messages
-    供后续 reflect 复用（避免冷启动重复 list_tables/get_schema）。
+    设计原则（"graph 就是 findings"）：sub-loop 内不强制 LLM 输出自然语言总结，
+    只累积 raw messages (AIMessage tool_calls + ToolMessage)。schema 发现消息单
+    独抽出存 state.schema_messages 供后续 reflect 复用，避免冷启动重复
+    list_tables/get_schema。后续 build_graph 节点会基于 raw messages 直接 compress
+    成 v2 graph，graph 就是 finding 的结构化形态。
     """
     logger.info("STARTING DATA RESEARCH")
     data_dir = config["configurable"]["data_dir"]
     queries = state.get("queries") or []
     system_prompt = config["configurable"].get("system_prompt", "")
 
-    all_findings: list[str] = []
     all_msgs: list = []
-
     for q in queries:
         query_text = q["query"] if isinstance(q, dict) else str(q)
         logger.info(f"Researching: {query_text[:80]}...")
-        findings, msgs = run_data_exploration(
+        # run_data_exploration still returns (findings_text, raw_msgs) for
+        # backwards-compat; we discard the findings text since v2 graph from
+        # the next compress step is the structured finding.
+        _findings_discarded, msgs = run_data_exploration(
             query_text, data_dir, system_prompt, max_rounds=60
         )
-        all_findings.append(findings)
         all_msgs.extend(msgs)
 
     schema_msgs = extract_schema_messages(all_msgs)
     logger.info(
-        f"Data research complete: {len(all_findings)} findings, "
+        f"Data research complete: {len(all_msgs)} raw messages, "
         f"{len(schema_msgs)} schema messages saved for reflect"
     )
 
     return {
-        "data_research_results": all_findings,       # plain text findings
-        "schema_messages": schema_msgs,              # for refine sub-loop reuse
-        "accumulated_findings": list(all_findings),  # 累积 findings 给 compress
-        "all_tool_messages": all_msgs,
+        "schema_messages": schema_msgs,    # for refine sub-loop reuse
+        "all_tool_messages": all_msgs,     # raw messages → compress's evidence source
     }
 
 
@@ -657,23 +674,18 @@ def data_research(state: RCAState, config: RunnableConfig) -> dict:
 
 def build_graph(state: RCAState, config: RunnableConfig) -> dict:
     """
-    用 stdin 的 compress_* prompts 把 main loop 的 findings 压成 CausalGraph v0。
-    这是中间状态的初始版本，后续 reflect 会在它基础上锦上添花。
+    把 main loop 累积的 raw messages 用 compress 压成 v2 CausalGraph v0。
+    这是 "中间 finding" 的初始版本（v2 schema），后续 reflect 阶段会基于它
+    继续 strengthen 演化（reflect sub-loop 看到 v_n graph 决定下一步）。
     """
     logger.info("BUILD GRAPH v0")
     compress_sp = config["configurable"]["compress_system_prompt"]
     compress_up = config["configurable"]["compress_user_prompt"]
-    accumulated = state.get("accumulated_findings") or []
-    # Pass ALL accumulated main-loop raw messages (tool_calls + tool results)
-    # so compress sees the full raw trajectory alongside findings (matches
-    # ThinkDepthAI upstream design). build_graph runs first time so no
-    # previous_graph baseline yet.
+    # Pass ALL accumulated main-loop raw messages (tool_calls + tool results).
+    # graph IS the finding (no parallel findings list).
     raw_all = state.get("all_tool_messages") or []
 
-    graph = compress_to_graph(
-        accumulated, compress_sp, compress_up,
-        raw_recent_messages=raw_all,
-    )
+    graph = compress_to_graph(raw_all, compress_sp, compress_up)
     # v2 schema: root_causes + propagation. Logger keeps both names for debug.
     logger.info(
         f"graph_v0 built: {len(graph.get('root_causes', []))} root_causes, "
@@ -708,9 +720,8 @@ def reflect_on_graph(state: RCAState, config: RunnableConfig) -> dict:
         or config["configurable"].get("user_prompt", "")
     )
 
-    graph = state.get("causal_graph") or {"nodes": [], "edges": [], "root_causes": []}
+    graph = state.get("causal_graph") or {"root_causes": [], "propagation": []}
     schema_msgs = state.get("schema_messages") or []
-    accumulated = list(state.get("accumulated_findings") or [])
     all_msgs: list = []
 
     if not schema_msgs:
@@ -719,59 +730,62 @@ def reflect_on_graph(state: RCAState, config: RunnableConfig) -> dict:
             "refine sub-loop will run without prior schema context"
         )
 
+    main_loop_raw = state.get("all_tool_messages") or []
+
     for i in range(num_reflections):
         logger.info(f"Refine iteration {i + 1}/{num_reflections}")
 
-        findings, msgs = run_refine_exploration(
+        # Pass main-loop raw messages + all previous refine rounds' raw messages
+        # so this refine sub-loop sees the FULL prior trajectory, not just the
+        # high-level v_n graph. This lets refine LLM look at concrete evidence
+        # (early SQL results, schema findings) when deciding what to strengthen.
+        prior_messages = list(main_loop_raw) + list(all_msgs)
+
+        # run_refine_exploration returns (findings_text, raw_msgs).
+        # findings text is discarded — graph IS the finding (next compress step
+        # produces the structured v_{i+1} from accumulated raw messages).
+        _findings_discarded, msgs = run_refine_exploration(
             original_query=original_query,
             data_dir=data_dir,
             system_prompt=system_prompt,
-            current_graph=graph,
+            current_graph=graph,      # v_i graph injected into sub-loop HumanMessage
             schema_msgs=schema_msgs,
+            prior_messages=prior_messages,  # FULL accumulated raw trajectory
             max_rounds=10,
         )
-        all_msgs.extend(msgs)
-
-        if not findings or not findings.strip():
+        if not msgs:
             logger.warning(
-                f"Refine iteration {i + 1} produced empty findings, "
-                f"keeping previous graph"
+                f"Refine iteration {i + 1} produced no messages, keeping previous graph"
             )
             continue
+        all_msgs.extend(msgs)
 
-        accumulated.append(findings)
-
-        # Compress sees: accumulated findings + ALL raw messages (main-loop +
-        # every refine round so far). Each compress is INDEPENDENT: it doesn't
-        # take the previous v_n graph as baseline — instead the v_n graph was
-        # already injected into THIS refine sub-loop's HumanMessage (via
-        # `current_graph=graph` in run_refine_exploration), so the sub-loop's
-        # LLM already saw it and let that shape its investigation. The new
-        # accumulated trajectory thus encodes "v_n graph + delta evidence",
-        # and compress builds v_{n+1} from that combined evidence.
+        # Compress sees ALL raw messages (main-loop + every refine round so far).
+        # Each compress is INDEPENDENT — it does NOT take the previous v_n graph
+        # as baseline. Instead, v_n was already injected into THIS refine
+        # sub-loop's HumanMessage (via `current_graph=graph` above), so the
+        # sub-loop's investigation was shaped by v_n. The new accumulated raw
+        # messages thus encode "v_n graph + delta evidence", and compress builds
+        # v_{n+1} from that combined raw evidence — fresh, not edit-of-baseline.
         raw_for_compress = list(state.get("all_tool_messages") or []) + list(all_msgs)
-        new_graph = compress_to_graph(
-            accumulated, compress_sp, compress_up,
-            raw_recent_messages=raw_for_compress,
-        )
-        # 防御：如果 compress 失败返回了空 graph，保留上一版本不退化
-        if new_graph.get("root_causes") or new_graph.get("nodes"):
+        new_graph = compress_to_graph(raw_for_compress, compress_sp, compress_up)
+
+        # 防御：如果 compress 失败返回了空 v2 envelope，保留上一版本不退化
+        if new_graph.get("root_causes") or new_graph.get("propagation"):
             graph = new_graph
             logger.info(
                 f"graph_v{i + 1}: {len(graph.get('root_causes', []))} root_causes, "
-                f"{len(graph.get('propagation', []))} propagation_edges "
-                f"(legacy: nodes={len(graph.get('nodes', []))}, edges={len(graph.get('edges', []))})"
+                f"{len(graph.get('propagation', []))} propagation_edges"
             )
         else:
             logger.warning(
-                f"Refine iteration {i + 1}: compress returned empty graph, "
+                f"Refine iteration {i + 1}: compress returned empty v2 envelope, "
                 f"keeping previous version"
             )
 
     logger.info("Reflection complete")
     return {
         "causal_graph": graph,
-        "accumulated_findings": accumulated,
         "all_tool_messages": all_msgs,
     }
 
@@ -944,13 +958,12 @@ def main():
 
     agent = build_agent()
 
-    # 初始状态（中间状态 causal_graph 替代了原 AIRA 的 running_summary text）
+    # 初始状态。"graph 就是 findings" 设计 — causal_graph 是结构化 finding，
+    # 不维护 accumulated_findings 自然语言列表。
     initial_state = {
         "queries": [],
-        "data_research_results": [],
         "schema_messages": [],
-        "causal_graph": {"nodes": [], "edges": [], "root_causes": []},
-        "accumulated_findings": [],
+        "causal_graph": {"root_causes": [], "propagation": []},  # v2 schema empty
         "final_report": "",
         "all_tool_messages": [],
     }
