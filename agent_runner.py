@@ -343,17 +343,57 @@ def compress_to_graph(
     accumulated_findings: list[str],
     compress_sp: str,
     compress_up: str,
+    raw_recent_messages: list | None = None,
     max_retries: int = 3,
 ) -> dict:
     """
     用 stdin 传入的 compress_system_prompt + compress_user_prompt 把累积 findings
-    压成 CausalGraph dict。每次都从全部 findings 重新生成（让新证据自然修正旧
+    压成 v2 CausalGraph dict。每次都从全部 findings 重新生成（让新证据自然修正旧
     结论），不增量更新 graph。
+
+    Args:
+        accumulated_findings: data_research / refine sub-loops 输出的 findings 文字
+            (list[str])，每条是 LLM 已经总结过的高层叙述。
+        compress_sp: stdin 传入的 v3 COMPRESS_FINDINGS_SP (含 v3 agent_contract
+            schema)。
+        compress_up: stdin 传入的 v3 COMPRESS_FINDINGS_UP。
+        raw_recent_messages: 可选 — 主 ReAct loop / refine sub-loop 的最近若干条
+            原始 LangChain BaseMessage（含 AIMessage tool_calls + ToolMessage
+            原始 SQL/result）。如果传入，compress 同时看到 raw 证据 + 高层
+            findings，匹配 ThinkDepthAI 上游"compress 看完整 raw trajectory"的
+            设计意图，避免 findings 文字总结丢失底层证据。
 
     失败兜底：3 次重试解析失败 → 返回空 graph，不崩溃。
     """
+    from langchain_core.messages import AIMessage, ToolMessage as LCToolMessage
+
     findings_text = "\n\n---\n\n".join(accumulated_findings)
     llm = _make_model(max_tokens=32000)
+
+    # If raw messages provided, materialize them into the prompt text alongside findings.
+    raw_text = ""
+    if raw_recent_messages:
+        raw_blocks = []
+        for m in raw_recent_messages:
+            if isinstance(m, AIMessage):
+                content = m.content if isinstance(m.content, str) else str(m.content)
+                tool_calls_str = ""
+                if getattr(m, "tool_calls", None):
+                    tool_calls_str = "\n  tool_calls: " + json.dumps(
+                        [{"name": tc.get("name", ""), "args": tc.get("args", {})}
+                         for tc in m.tool_calls],
+                        ensure_ascii=False,
+                    )
+                raw_blocks.append(f"[Assistant] {content}{tool_calls_str}")
+            elif isinstance(m, LCToolMessage):
+                content = m.content if isinstance(m.content, str) else str(m.content)
+                raw_blocks.append(f"[Tool Result] {content}")
+        if raw_blocks:
+            raw_text = (
+                "## Raw investigation evidence (assistant tool_calls + tool results)\n\n"
+                + "\n\n".join(raw_blocks)
+                + "\n\n---\n\n"
+            )
 
     last_err: str | None = None
     for attempt in range(max_retries):
@@ -361,8 +401,10 @@ def compress_to_graph(
             SystemMessage(content=compress_sp),
             HumanMessage(
                 content=(
-                    f"Here is my complete RCA investigation findings:\n\n"
+                    f"{raw_text}"
+                    f"## High-level investigation findings\n\n"
                     f"{findings_text}\n\n"
+                    f"---\n\n"
                     f"{compress_up}"
                 )
             ),
@@ -383,7 +425,7 @@ def compress_to_graph(
     logger.error(
         f"compress_to_graph failed all {max_retries} attempts; returning empty graph"
     )
-    return {"nodes": [], "edges": [], "root_causes": []}
+    return {"root_causes": [], "propagation": []}  # v2 schema empty envelope
 
 
 # ── Helper: refine sub-loop（复用 main loop 上下文，锦上添花当前 graph）──────
@@ -427,24 +469,42 @@ def run_refine_exploration(
         )),
         # ③ 直接塞入 main loop 的真实 schema 发现消息对（AIMessage + ToolMessage）
         *schema_msgs,
-        # ④ 追加 refine 指令 + 当前 CausalGraph
+        # ④ 追加 refine 指令 + 当前 RCA output (v2 schema) + schema reminder
+        # Important: explicitly tell the LLM the output schema (v2 from
+        # rcabench-platform agent_contract) so it understands which fields
+        # to strengthen. The current_graph passed in is already in v2 format
+        # (root_causes + propagation, with fault_kind enum), produced by
+        # compress_to_graph using the v3 agent_contract.
         HumanMessage(content=(
             f"You have already discovered the data schema above. Now you need to "
-            f"REFINE (strengthen, not overturn) the preliminary root cause graph "
-            f"produced from your earlier investigation:\n\n"
+            f"REFINE (strengthen, not overturn) the preliminary RCA output produced "
+            f"from your earlier investigation. The output below is in the **v2 RCA "
+            f"schema** that the final compress step expects.\n\n"
+            f"## Current RCA output (v2 schema)\n\n"
             f"```json\n{json.dumps(current_graph, ensure_ascii=False, indent=2)}\n```\n\n"
+            f"## v2 schema reminder (final output spec)\n\n"
+            f"- `root_causes[]`: each item is `{{service, fault_kind, evidence: [{{kind, sql, claim}}]}}`\n"
+            f"- `propagation[]`: each item is `{{from, to, evidence: [...]}}` — the\n"
+            f"  fault-impact chain (failing service → service further toward user-visible alarm)\n"
+            f"- `fault_kind`: enum drawn from {{pod_failure, pod_unavailable,\n"
+            f"  network_delay, network_loss, network_partition, http_aborted, http_slow,\n"
+            f"  cpu_stress, mem_stress, jvm_gc_pressure, jvm_method_latency, dns_resolution_failed,\n"
+            f"  clock_skew, ...}}\n"
+            f"- Every `evidence` item must be a real DuckDB SQL with a <=20-word claim\n\n"
             f"## Your task\n\n"
-            f"Pick the SINGLE weakest aspect of this graph:\n"
-            f"- A suspected root cause with no/thin evidence\n"
-            f"- An edge claimed as causal but only supported by correlation\n"
-            f"- A service on the fault path that wasn't investigated\n"
+            f"Pick the SINGLE weakest aspect of this output:\n"
+            f"- A `root_causes[]` entry with thin evidence (add another supporting SQL)\n"
+            f"- A `root_causes[]` entry whose `fault_kind` doesn't fit the evidence\n"
+            f"- A `propagation[]` edge claimed as causal but only correlation\n"
+            f"- A service on the suspected fault path that wasn't investigated yet\n"
             f"- A missing baseline comparison (normal vs abnormal)\n\n"
             f"Then gather additional SQL evidence to STRENGTHEN it. Rules:\n"
             f"- STRENGTHEN, do not overturn well-supported conclusions\n"
             f"- Use `query_parquet_files` directly; do NOT re-run "
             f"`list_tables_in_directory` or `get_schema` for tables you already know\n"
             f"- Target 5-8 tool calls. When you have your refinement evidence, "
-            f"stop calling tools and return your findings as plain text."
+            f"stop calling tools and return your findings as plain text. The next\n"
+            f"  compress step will rewrite the v2 JSON envelope with your new evidence."
         )),
     ]
 
@@ -599,12 +659,17 @@ def build_graph(state: RCAState, config: RunnableConfig) -> dict:
     compress_sp = config["configurable"]["compress_system_prompt"]
     compress_up = config["configurable"]["compress_user_prompt"]
     accumulated = state.get("accumulated_findings") or []
+    # Pass main-loop raw messages so compress sees both the high-level findings
+    # AND the original tool_calls / tool results (matches ThinkDepthAI upstream
+    # design that compress sees full raw trajectory).
+    raw_recent = state.get("all_tool_messages") or []
 
-    graph = compress_to_graph(accumulated, compress_sp, compress_up)
+    graph = compress_to_graph(accumulated, compress_sp, compress_up, raw_recent_messages=raw_recent)
+    # v2 schema: root_causes + propagation. Logger keeps both names for debug.
     logger.info(
-        f"graph_v0 built: {len(graph.get('nodes', []))} nodes, "
-        f"{len(graph.get('edges', []))} edges, "
-        f"{len(graph.get('root_causes', []))} root_causes"
+        f"graph_v0 built: {len(graph.get('root_causes', []))} root_causes, "
+        f"{len(graph.get('propagation', []))} propagation_edges "
+        f"(legacy: nodes={len(graph.get('nodes', []))}, edges={len(graph.get('edges', []))})"
     )
     return {"causal_graph": graph}
 
@@ -667,14 +732,18 @@ def reflect_on_graph(state: RCAState, config: RunnableConfig) -> dict:
 
         accumulated.append(findings)
 
-        new_graph = compress_to_graph(accumulated, compress_sp, compress_up)
+        # Compress sees: accumulated findings + main-loop raw messages + this
+        # refine round's raw messages. This matches ThinkDepthAI upstream's
+        # "compress on full raw trajectory" design.
+        raw_for_compress = list(state.get("all_tool_messages") or []) + list(all_msgs)
+        new_graph = compress_to_graph(accumulated, compress_sp, compress_up, raw_recent_messages=raw_for_compress)
         # 防御：如果 compress 失败返回了空 graph，保留上一版本不退化
-        if new_graph.get("nodes") or new_graph.get("root_causes"):
+        if new_graph.get("root_causes") or new_graph.get("nodes"):
             graph = new_graph
             logger.info(
-                f"graph_v{i + 1}: {len(graph.get('nodes', []))} nodes, "
-                f"{len(graph.get('edges', []))} edges, "
-                f"{len(graph.get('root_causes', []))} root_causes"
+                f"graph_v{i + 1}: {len(graph.get('root_causes', []))} root_causes, "
+                f"{len(graph.get('propagation', []))} propagation_edges "
+                f"(legacy: nodes={len(graph.get('nodes', []))}, edges={len(graph.get('edges', []))})"
             )
         else:
             logger.warning(
